@@ -30,26 +30,26 @@ END_COUNT=$(find "$IMG_PATH" -type f | wc -l)
 
 # inference with smplest_x
 PYTHONPATH=../:$PYTHONPATH \
-python main/inference.py \
-    --num_gpus 1 \
+GLOG_minloglevel=1 python main/inference.py \
+    --num_gpus 16 \
     --file_name $NAME \
     --ckpt_name $CKPT_NAME \
     --end $END_COUNT \
 
 
 # convert frames to video
-case "$EXT" in
-    mp4|avi|mov|mkv|flv|wmv|webm|mpeg|mpg)
-        ffmpeg -y -f image2 -r ${FPS} -i ${OUTPUT_PATH}/%06d.jpg -vcodec mjpeg -qscale 0 -pix_fmt yuv420p ./demo/result_${NAME}.mp4
-        ;;
-    jpg|jpeg|png|bmp|gif|tiff|tif|webp|svg)
-        cp $OUTPUT_PATH/000001.$EXT ./demo/result_$FILE_NAME
-        ;;
-    *)
-        exit 1
-        ;;
-esac
+# case "$EXT" in
+#     mp4|avi|mov|mkv|flv|wmv|webm|mpeg|mpg)
+#         ffmpeg -y -f image2 -r ${FPS} -i ${OUTPUT_PATH}/%06d.jpg -vcodec mjpeg -qscale 0 -pix_fmt yuv420p ./demo/result_${NAME}.mp4
+#         ;;
+#     jpg|jpeg|png|bmp|gif|tiff|tif|webp|svg)
+#         cp $OUTPUT_PATH/000001.$EXT ./demo/result_$FILE_NAME
+#         ;;
+#     *)
+#         exit 1
+#         ;;
+# esac
 
 rm -rf ./demo/input_frames
-rm -rf ./demo/output_frames
+# rm -rf ./demo/output_frames
 

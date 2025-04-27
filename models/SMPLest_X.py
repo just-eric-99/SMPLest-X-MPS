@@ -7,9 +7,11 @@ import copy
 from models.module import TransformerDecoderHead, ViT
 from models.loss import CoordLoss, ParamLoss
 from human_models.human_models import SMPL, SMPLX
-from utils.transforms import rot6d_to_axis_angle, batch_rodrigues, rot6d_to_rotmat
+from utils.transforms import rot6d_to_axis_angle, batch_rodrigues, rot6d_to_rotmat, rotation_matrix_to_angle_axis, rotation_matrix_to_axis_angle
 from utils.data_utils import load_img
+from utils.distribute_utils import get_device
 
+from pytorch3d.transforms import matrix_to_axis_angle
 
 class Model(nn.Module):
     def __init__(self, config, encoder, decoder):
@@ -20,9 +22,10 @@ class Model(nn.Module):
         self.cfg = config
         self.encoder = encoder
         self.decoder = decoder
+        self.device = get_device()
 
         # loss
-        self.smplx_layer = copy.deepcopy(self.smpl_x.layer['neutral']).cuda()
+        self.smplx_layer = copy.deepcopy(self.smpl_x.layer['neutral']).to(self.device)
         self.coord_loss = CoordLoss()
         self.param_loss = ParamLoss()
 
@@ -44,14 +47,14 @@ class Model(nn.Module):
         gamma = torch.sigmoid(cam_param[:, 2])  # apply sigmoid to make it positive
         k_value = torch.FloatTensor([math.sqrt(self.cfg.model.focal[0] * self.cfg.model.focal[1] * 
                             self.cfg.model.camera_3d_size * self.cfg.model.camera_3d_size / (
-                self.cfg.model.input_body_shape[0] * self.cfg.model.input_body_shape[1]))]).cuda().view(-1)
+                self.cfg.model.input_body_shape[0] * self.cfg.model.input_body_shape[1]))]).to(self.device).view(-1)
         t_z = k_value * gamma
         cam_trans = torch.cat((t_xy, t_z[:, None]), 1)
         return cam_trans
 
     def get_coord(self, root_pose, body_pose, lhand_pose, rhand_pose, jaw_pose, shape, expr, cam_trans, mode):
         batch_size = root_pose.shape[0]
-        zero_pose = torch.zeros((1, 3)).float().cuda().repeat(batch_size, 1)  # eye poses
+        zero_pose = torch.zeros((1, 3)).float().to(self.device).repeat(batch_size, 1)  # eye poses
         # transl=cam_trans, 
         output = self.smplx_layer(betas=shape, body_pose=body_pose, global_orient=root_pose, right_hand_pose=rhand_pose,
                                   transl=cam_trans, left_hand_pose=lhand_pose, jaw_pose=jaw_pose, leye_pose=zero_pose,
@@ -148,6 +151,25 @@ class Model(nn.Module):
         batch_hand_global_rotmat = torch.cat(hand_global_rotmat, dim=0)
         return batch_hand_global_rotmat
 
+    def get_root_translation(self, root_pose, body_pose, lhand_pose, rhand_pose, jaw_pose, shape, expr, cam_trans):
+      """
+      Get the translation of the root (pelvis) joint in camera space.
+      """
+      batch_size = root_pose.shape[0]
+      zero_pose = torch.zeros((1, 3)).float().to(self.device).repeat(batch_size, 1)  # eye poses
+      
+      # Get SMPLX output
+      output = self.smplx_layer(betas=shape, body_pose=body_pose, global_orient=root_pose, 
+                                right_hand_pose=rhand_pose, transl=cam_trans, 
+                                left_hand_pose=lhand_pose, jaw_pose=jaw_pose, 
+                                leye_pose=zero_pose, reye_pose=zero_pose, expression=expr)
+      
+      # Extract the root (pelvis) joint position in camera space
+      joint_cam = output.joints
+      root_translation = joint_cam[:, self.smpl_x.root_joint_idx, :]
+      
+      return root_translation
+    
     def forward(self, inputs, targets, meta_info, mode):
         body_img = F.interpolate(inputs['img'], self.cfg.model.input_body_shape)
 
@@ -156,12 +178,43 @@ class Model(nn.Module):
 
         # 2. Decoder
         pred_mano_params = self.decoder(task_tokens, img_feat)
+        """
+        dict_keys([
+          'body_root_pose', 
+          'body_pose', 
+          'body_betas', 
+          'body_cam', 
+          'lhand_root_pose', 
+          'rhand_root_pose', 
+          'lhand_pose', 
+          'rhand_pose', 
+          'lhand_cam', 
+          'rhand_cam', 
+          'face_root_pose', 
+          'face_expression', 
+          'face_jaw_pose', 
+          'face_cam']
+          )
+        """
+        # print(pred_mano_params.keys())
 
         # get transl
         body_trans = self.get_camera_trans(pred_mano_params['body_cam'])
         lhand_trans = self.get_camera_trans(pred_mano_params['lhand_cam'])
         rhand_trans = self.get_camera_trans(pred_mano_params['rhand_cam'])
         face_trans = self.get_camera_trans(pred_mano_params['face_cam'])
+        
+        
+        
+        # print("body_trans: ", body_trans)
+        # print("lhand_trans: ", lhand_trans)
+        # print("rhand_trans: ", rhand_trans)
+        # print("face_trans: ", face_trans)
+        
+        # print("pred_mano_params['body_cam']: ", pred_mano_params['body_cam'])
+        # print("pred_mano_params['lhand_cam']: ", pred_mano_params['lhand_cam'])
+        # print("pred_mano_params['rhand_cam']: ", pred_mano_params['rhand_cam'])
+        # print("pred_mano_params['face_cam']: ", pred_mano_params['face_cam'])
 
         # convert predicted rot6d to aa (not unique convention may cause problem)
         root_pose_aa = rot6d_to_axis_angle(pred_mano_params['body_root_pose'])
@@ -196,6 +249,12 @@ class Model(nn.Module):
                                                                             pred_mano_params['body_betas'], 
                                                                             pred_mano_params['face_expression'], 
                                                                             body_trans, mode)
+        
+        root_translation = self.get_root_translation(root_pose_aa, body_pose_aa, lhand_pose_aa, 
+                                           rhand_pose_aa, face_jaw_pose_aa, 
+                                           pred_mano_params['body_betas'], 
+                                           pred_mano_params['face_expression'], 
+                                           body_trans)
         
         if mode == 'train':
             loss = {}
@@ -308,7 +367,8 @@ class Model(nn.Module):
 
         else:
             if mode == 'test' and 'smplx_mesh_cam' in targets:
-                mesh_pseudo_gt, _ = self.generate_mesh_gt(targets, mode)
+                mesh_pseudo_gt, root_cam = self.generate_mesh_gt(targets, mode)
+                print("inside mesh_pseudo_gt.shape, mesh_pseudo_gt.shape[0])")
 
             # test output
             out = {}
@@ -323,7 +383,11 @@ class Model(nn.Module):
             out['smplx_shape'] = pred_mano_params['body_betas']
             out['smplx_expr'] = pred_mano_params['face_expression']
             out['cam_trans'] = body_trans
+            out['raw_cam_params'] = pred_mano_params['body_cam'] # Add raw params
             out['smplx_joint_cam'] = joint_cam_wo_ra # for bedlam test
+            out['pred_root_cam'] = pred_root_cam
+            out['root_translation'] = root_translation
+            out["joint_cam"] = joint_cam
 
 
             if 'smplx_shape' in targets:

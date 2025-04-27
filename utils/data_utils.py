@@ -374,6 +374,7 @@ def process_human_model_output(human_model_param, cam_param, do_flip, img_shape,
         joint_cam = output.joints[0].numpy()[smpl_x.joint_idx, :]
  
         if 'R' in cam_param and 't' in cam_param:
+            print("inside R and t")
             R, t = np.array(cam_param['R'], dtype=np.float32).reshape(3, 3), np.array(cam_param['t'],
                                                                                       dtype=np.float32).reshape(1, 3)
             root_cam = joint_cam[smpl_x.root_joint_idx, None, :]

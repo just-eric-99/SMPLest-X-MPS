@@ -2,7 +2,10 @@ import torch
 import numpy as np
 from torch.nn import functional as F
 from einops.einops import rearrange
+from utils.distribute_utils import get_device
+import math
 
+device = get_device()
 
 def cam2pixel(cam_coord, f, c):
     x = cam_coord[:, 0] / cam_coord[:, 2] * f[0] + c[0]
@@ -234,7 +237,7 @@ def rot6d_to_axis_angle(x):
     b3 = torch.cross(b1, b2)
     rot_mat = torch.stack((b1, b2, b3), dim=-1)  # 3x3 rotation matrix
 
-    rot_mat = torch.cat([rot_mat, torch.zeros((batch_size, 3, 1)).cuda().float()], 2)  # 3x4 rotation matrix
+    rot_mat = torch.cat([rot_mat, torch.zeros((batch_size, 3, 1)).to(device).float()], 2)  # 3x4 rotation matrix
     axis_angle = rotation_matrix_to_angle_axis(rot_mat).reshape(-1, 3)  # axis-angle 
     axis_angle[torch.isnan(axis_angle)] = 0.0
     return axis_angle
@@ -333,8 +336,8 @@ def soft_argmax_2d(heatmap2d):
     accu_x = heatmap2d.sum(dim=(2))
     accu_y = heatmap2d.sum(dim=(3))
 
-    accu_x = accu_x * torch.arange(width).float().cuda()[None, None, :]
-    accu_y = accu_y * torch.arange(height).float().cuda()[None, None, :]
+    accu_x = accu_x * torch.arange(width).float().to(device)[None, None, :]
+    accu_y = accu_y * torch.arange(height).float().to(device)[None, None, :]
 
     accu_x = accu_x.sum(dim=2, keepdim=True)
     accu_y = accu_y.sum(dim=2, keepdim=True)
@@ -354,9 +357,9 @@ def soft_argmax_3d(heatmap3d):
     accu_y = heatmap3d.sum(dim=(2, 4))
     accu_z = heatmap3d.sum(dim=(3, 4))
 
-    accu_x = accu_x * torch.arange(width).float().cuda()[None, None, :]
-    accu_y = accu_y * torch.arange(height).float().cuda()[None, None, :]
-    accu_z = accu_z * torch.arange(depth).float().cuda()[None, None, :]
+    accu_x = accu_x * torch.arange(width).float().to(device)[None, None, :]
+    accu_y = accu_y * torch.arange(height).float().to(device)[None, None, :]
+    accu_z = accu_z * torch.arange(depth).float().to(device)[None, None, :]
 
     accu_x = accu_x.sum(dim=2, keepdim=True)
     accu_y = accu_y.sum(dim=2, keepdim=True)
@@ -364,3 +367,134 @@ def soft_argmax_3d(heatmap3d):
 
     coord_out = torch.cat((accu_x, accu_y, accu_z), dim=2)
     return coord_out
+
+def rotation_matrix_to_axis_angle(rotation_matrix):
+    """
+    Convert rotation matrices to axis-angle representation.
+    rotation_matrix: tensor of shape (N, 3, 3)
+    Returns axis_angle: tensor of shape (N, 3)
+    """
+    batch_size = rotation_matrix.shape[0]
+    device = rotation_matrix.device
+
+    # Angle calculation
+    trace = torch.einsum('bii->b', rotation_matrix)
+    theta = torch.acos(torch.clamp((trace - 1) / 2, -1.0, 1.0))
+
+    # Axis calculation
+    axis = torch.zeros(batch_size, 3, device=device)
+    epsilon = 1e-6
+    near_zero = theta < epsilon
+    near_pi = theta > (math.pi - epsilon)
+
+    # Case 1: theta near 0
+    axis[near_zero] = torch.tensor([1.0, 0.0, 0.0], device=device)
+
+    # Case 2: theta near pi
+    if near_pi.any():
+        R = rotation_matrix[near_pi]
+        a = (R[:, 0, 0] + 1) / 2
+        b = (R[:, 1, 1] + 1) / 2
+        c = (R[:, 2, 2] + 1) / 2
+        max_val, indices = torch.max(torch.stack([a, b, c], dim=1), dim=1)
+        for i in range(3):
+            mask = indices == i
+            if not mask.any():
+                continue
+            axis_i = torch.zeros_like(R[mask, 0, 0])
+            if i == 0:
+                axis_i = torch.sqrt((R[mask, 0, 0] + 1) / 2)
+                axis_i = torch.stack([
+                    axis_i,
+                    R[mask, 0, 1] / (2 * axis_i),
+                    R[mask, 0, 2] / (2 * axis_i)
+                ], dim=1)
+            elif i == 1:
+                axis_i = torch.sqrt((R[mask, 1, 1] + 1) / 2)
+                axis_i = torch.stack([
+                    R[mask, 1, 0] / (2 * axis_i),
+                    axis_i,
+                    R[mask, 1, 2] / (2 * axis_i)
+                ], dim=1)
+            else:
+                axis_i = torch.sqrt((R[mask, 2, 2] + 1) / 2)
+                axis_i = torch.stack([
+                    R[mask, 2, 0] / (2 * axis_i),
+                    R[mask, 2, 1] / (2 * axis_i),
+                    axis_i
+                ], dim=1)
+            axis_i = axis_i / torch.norm(axis_i, dim=1, keepdim=True)
+            axis[near_pi][mask] = axis_i
+
+    # Case 3: general theta
+    general = ~near_zero & ~near_pi
+    if general.any():
+        R_gen = rotation_matrix[general]
+        K = (R_gen - R_gen.transpose(1, 2)) / (2 * torch.sin(theta[general, None, None]))
+        axis_gen = torch.stack([K[:, 2, 1], K[:, 0, 2], K[:, 1, 0]], dim=1)
+        axis_gen = axis_gen / torch.norm(axis_gen, dim=1, keepdim=True)
+        axis[general] = axis_gen
+
+    axis_angle = axis * theta[:, None]
+    return axis_angle
+  
+  
+def weak_perspective_to_root_translation(pred_cam, focal_length, principal_point, epsilon=1e-9):
+    """
+    Converts predicted weak perspective camera parameters (s, tx, ty) to 3D root translation (X, Y, Z) in camera coordinates.
+    
+    In weak perspective model:
+    - 's' is the scaling factor (inversely proportional to depth)
+    - 'tx', 'ty' are normalized 2D translations in the image plane
+    
+    Args:
+        pred_cam (torch.Tensor): Predicted camera parameters of shape (N, 3), 
+                                where each row is [scale, trans_x, trans_y].
+        focal_length (tuple or list): Camera focal length (fx, fy).
+        principal_point (tuple or list): Camera principal point (cx, cy).
+        epsilon (float): A small value to prevent division by zero.
+    
+    Returns:
+        torch.Tensor: Estimated 3D root translation (X, Y, Z) of shape (N, 3) 
+                     on the same device as pred_cam.
+    """
+    # Extract weak perspective parameters
+    s = pred_cam[:, 0]  # Scale factor
+    tx = pred_cam[:, 1]  # Normalized x-translation in image plane
+    ty = pred_cam[:, 2]  # Normalized y-translation in image plane
+    
+    # Convert focal length and principal point to tensors on same device as pred_cam
+    device, dtype = pred_cam.device, pred_cam.dtype
+    fx, fy = focal_length
+    cx, cy = principal_point
+    
+    if not isinstance(fx, torch.Tensor):
+        fx = torch.tensor(fx, device=device, dtype=dtype)
+    if not isinstance(fy, torch.Tensor):
+        fy = torch.tensor(fy, device=device, dtype=dtype)
+    if not isinstance(cx, torch.Tensor):
+        cx = torch.tensor(cx, device=device, dtype=dtype)
+    if not isinstance(cy, torch.Tensor):
+        cy = torch.tensor(cy, device=device, dtype=dtype)
+    
+    # Ensure these values can be properly broadcast
+    for tensor in [fx, fy, cx, cy]:
+        if tensor.dim() > 0 and tensor.shape[0] != pred_cam.shape[0]:
+            raise ValueError(f"Shape mismatch: camera parameters batch size {pred_cam.shape[0]} doesn't match intrinsics shape {tensor.shape[0]}")
+    
+    # Step 1: Estimate Z from scale factor 's'
+    # In weak perspective, s = f/Z, so Z = f/s
+    f_avg = (fx + fy) / 2.0
+    s_safe = torch.clamp(s, min=epsilon)  # Prevent division by zero
+    Z = f_avg / s_safe
+    
+    # Step 2: Convert normalized image coordinates to 3D coordinates
+    # Assume tx, ty are the predicted pixel offsets from the principal point (cx, cy)
+    # Calculate X and Y using perspective projection formulas inversion
+    X = tx * Z / fx 
+    Y = ty * Z / fy
+    
+    # Combine into (X, Y, Z) root translation
+    root_translation = torch.stack((X, Y, Z), dim=1)
+    
+    return root_translation

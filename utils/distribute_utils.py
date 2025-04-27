@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import random
 import numpy as np
+from typing import Dict, List, Optional, Tuple
 
 
 def get_dist_info():
@@ -27,11 +28,38 @@ def get_dist_info():
         world_size = 1
     return rank, world_size
 
-def set_seed(seed):
+def set_seed(seed=0) -> None:
+    """Set random seed.
+
+    Args:
+        seed (int, optional): Seed to be used. Defaults to 0.
+    """
+    # import pdb; pdb.set_trace()
     random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        # MPS doesn't need the same seed setting as CUDA
+        pass
+
+
+def get_device() -> torch.device:
+    """
+    Return the appropriate device based on availability.
+    Priority: CUDA > MPS > CPU
+    """
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device('mps')
+    else:
+        return torch.device('cpu')
 
 
 def time_synchronized():
